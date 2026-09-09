@@ -131,3 +131,16 @@ if __name__ == "__main__":
 
     for c in chunks[:5]:  # preview the first 5 chunks
         print(f" - {c['file_path']} [chunk {c['chunk_index']}]: {c['text'][:80]}...")
+
+# Filenames without an extension that we still want to include
+SPECIAL_FILENAMES = {"README", "LICENSE", "CONTRIBUTING", "CHANGELOG"}
+
+
+def is_supported_file(filename):
+    """Check if a file's extension (or known special name) is one we want."""
+    name, ext = os.path.splitext(filename)
+    if ext.lower() in SUPPORTED_EXTENSIONS:
+        return True
+    if name.upper() in SPECIAL_FILENAMES:
+        return True
+    return False
