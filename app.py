@@ -1,94 +1,81 @@
-import streamlit as st
-from github_loader import clone_repository, get_repo_name
-from processor import load_repository_files, chunk_repository_files
-from embeddings import embed_chunks, embed_query
-from retriever import build_faiss_index, load_faiss_index, search_index
-from llm import generate_answer
+from flask import Flask, render_template, request, jsonify
 import os
 
-st.set_page_config(page_title="GitHub Repo Q&A Chatbot", page_icon="🤖")
-st.title("🤖 GitHub Repository Q&A Chatbot")
-st.write("Enter a public GitHub repository URL, then ask questions about it.")
+from github_loader import clone_repository, get_repo_name
+from processor import load_repository_files, chunk_repository_files
+from embeddings import embed_chunks
+from retriever import build_faiss_index, load_faiss_index
+from agent import answer_with_agent
 
-# session_state keeps values between reruns (Streamlit reruns the whole
-# script on every interaction, so we store the index/chunks/chat here
-# instead of recomputing them every time)
-if "index" not in st.session_state:
-    st.session_state.index = None
-    st.session_state.chunks = None
-    st.session_state.repo_name = None
-    st.session_state.chat_history = []
+app = Flask(__name__)
 
 
-repo_url = st.text_input("Public GitHub repository URL")
+@app.route("/")
+def home():
+    return render_template("index.html")
 
-if st.button("Load Repository"):
-    if not repo_url.strip():
-        st.error("Please enter a repository URL.")
-    else:
-        with st.spinner("Cloning repository..."):
-            repo_path = clone_repository(repo_url)
-            repo_name = get_repo_name(repo_url)
+
+@app.route("/api/load_repo", methods=["POST"])
+def load_repo():
+    """Clone + index a repository. Returns repo_name to use in later questions."""
+    data = request.get_json()
+    repo_url = data.get("repo_url", "").strip()
+
+    if not repo_url:
+        return jsonify({"error": "Please enter a repository URL."}), 400
+
+    try:
+        repo_path = clone_repository(repo_url)
+        repo_name = get_repo_name(repo_url)
 
         index_path = os.path.join("data", f"{repo_name}.faiss")
 
         if os.path.exists(index_path):
-            # Already indexed before — just load it, no need to redo everything
-            with st.spinner("Loading existing index..."):
-                index, chunks = load_faiss_index(repo_name)
+            index, chunks = load_faiss_index(repo_name)
         else:
-            with st.spinner("Reading and filtering files..."):
-                files = load_repository_files(repo_path)
+            files = load_repository_files(repo_path)
+            if len(files) == 0:
+                return jsonify({"error": "No supported files were found in this repository."}), 400
 
-            with st.spinner("Splitting files into chunks..."):
-                chunks = chunk_repository_files(files)
+            chunks = chunk_repository_files(files)
+            chunks = embed_chunks(chunks)
+            build_faiss_index(chunks, repo_name)
+            index, chunks = load_faiss_index(repo_name)
 
-            with st.spinner(f"Generating embeddings for {len(chunks)} chunks..."):
-                chunks = embed_chunks(chunks)
+        return jsonify({"repo_name": repo_name, "chunk_count": len(chunks)})
 
-            with st.spinner("Building FAISS index..."):
-                build_faiss_index(chunks, repo_name)
-                index, chunks = load_faiss_index(repo_name)
-
-        st.session_state.index = index
-        st.session_state.chunks = chunks
-        st.session_state.repo_name = repo_name
-        st.session_state.chat_history = []
-
-        st.success(f"Repository indexed! ({len(chunks)} chunks ready)")
+    except ValueError as e:
+        return jsonify({"error": f"Invalid repository URL: {e}"}), 400
+    except RuntimeError as e:
+        return jsonify({"error": f"Could not clone repository: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Something went wrong: {e}"}), 500
 
 
-# Only show the chat interface once a repo has been loaded
-if st.session_state.index is not None:
-    st.subheader(f"Ask about: {st.session_state.repo_name}")
+@app.route("/api/ask", methods=["POST"])
+def ask():
+    """Answer a question about an already-loaded repository."""
+    data = request.get_json()
+    repo_name = data.get("repo_name", "").strip()
+    question = data.get("question", "").strip()
 
-    # Show past messages
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
+    if not repo_name or not question:
+        return jsonify({"error": "Missing repository or question."}), 400
 
-    question = st.chat_input("Ask a question about this repository...")
+    try:
+        # Reload from disk each time — simple and stateless, no server-side
+        # session needed, since retriever.py already persists the index.
+        index, chunks = load_faiss_index(repo_name)
+        result = answer_with_agent(question, index, chunks)
 
-    if question:
-        st.session_state.chat_history.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.write(question)
+        return jsonify({
+            "answer": result["answer"],
+            "sources": result["sources"],
+            "question_type": result["question_type"]
+        })
+    except Exception as e:
+        return jsonify({"error": f"Something went wrong while answering: {e}"}), 500
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                query_vector = embed_query(question)
-                results = search_index(
-                    st.session_state.index,
-                    st.session_state.chunks,
-                    query_vector,
-                    top_k=3
-                )
-                answer = generate_answer(question, results)
 
-                st.write(answer)
-
-                with st.expander("Sources"):
-                    for r in results:
-                        st.write(f"- `{r['file_path']}`")
-
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)
